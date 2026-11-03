@@ -7,7 +7,9 @@ Learn about the vision at [Me — Your intelligence. Yours.](https://mehomeai.re
 ## Status
 
 This repository provides the rerunnable development setup and managed lifecycle
-for the Me home service (implemented locally; all changes uncommitted):
+for the Me home service (implemented on review branch
+`feat/home-agent-foundation`; committed/pushed; draft PR #1 pending
+review/checks; no merge to protected `main`, no deployed release):
 `scripts/me_setup.py` (prerequisites, config, non-secret environment) and
 `scripts/me_lifecycle.py` (managed start/status/stop, home-CLI bootstrap,
 cloud-coordination activation (`coordinator prepare/activate/status/check`,
@@ -50,6 +52,13 @@ optional `cloudflare-access` mode enforces Access JWTs at the edge and needs
 separate edge auth (native phone clients cannot complete it). No root, no
 global install, no public endpoint; service units and tunnel launches are
 explicit operator actions.
+
+Planned next (not implemented yet): the home computer installs OpenCode;
+setup-infra acts as the independent supervisor with a persisted
+machine-verifiable checklist, continues OpenCode when it replies/stops
+early, and provides bounded retries/stall detection plus a
+needs-user-input state. THIS LAYER IS NOT IMPLEMENTED YET; the current
+deterministic setup/lifecycle tools form the executor/check foundation.
 
 ```sh
 python3 scripts/me_setup.py setup [--data-dir DIR] [--port N]
