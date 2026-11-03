@@ -8,6 +8,10 @@
 *.key
 *.p12
 *.pfx
+# S7 coordinator credentials (0600 private file; lives outside git by design)
+backend-home-token.json
+coordinator.json
+secrets/
 
 # Local editor and operating-system files
 .DS_Store

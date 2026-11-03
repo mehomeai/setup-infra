@@ -27,3 +27,32 @@ jobs:
         run: python3 scripts/check_repository.py
       - name: Check whitespace
         run: git show --format= --check HEAD
+
+  setup-tests:
+    name: Setup unit tests + dev smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js (matches home-api-v1 local requirement)
+        uses: actions/setup-node@49933ea5288caeca8642d1faee2d65b9227c12c00848 # v4.4.0
+        with:
+          node-version: 24.18.0
+      - name: Run setup suites (all offline unit + fail-closed integration)
+        # Runs ALL test_me*.py: setup, lifecycle, full-backup, crash-window.
+        # Sibling-dependent H1 cases skip with a transient note when
+        # ../infra-server or Node is unavailable (existing practice); unit,
+        # guardrail, backup/restore, and tunnel fail-closed tests run here.
+        # Do not narrow to two files: that omits full-backup/crash-window.
+        run: python3 -m unittest discover -s scripts -p 'test_me*.py' -v
+      - name: Smoke-test rerunnable setup and check
+        run: |
+          DEST="$(mktemp -d)/me-home"
+          python3 scripts/me_setup.py setup --data-dir "$DEST"
+          python3 scripts/me_setup.py setup --data-dir "$DEST"
+          python3 scripts/me_setup.py check --data-dir "$DEST"
+          python3 scripts/me_setup.py config-show --data-dir "$DEST" > /dev/null
+          test -f "$DEST/config/service.env"
