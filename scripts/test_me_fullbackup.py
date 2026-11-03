@@ -205,6 +205,26 @@ class FullBackupUnit(unittest.TestCase):
         self.assertIsNone(me_lifecycle.incomplete_journal(other),
                           "successful restore leaves no blocking journal")
 
+    def test_full_backup_refuses_with_declared_upstream_volumes(self):
+        # Declared upstream volumes (A datastorage-contract) are NEVER covered
+        # by the SQLite-only archive: full backup refuses explicitly rather
+        # than labelling an incomplete archive as full. Legacy SQLite-only
+        # behavior (no volumes) is unchanged (see roundtrip test above).
+        cfg = me_setup.load_config(self.data_dir)
+        cfg["volumes"] = {"postgres-data": {"scope": "postgres-data"},
+                          "agent-workspace": {"scope": "agent-workspace"},
+                          "agent-profiles": {"scope": "agent-profiles"}}
+        me_setup.write_atomic(me_setup.config_path(self.data_dir),
+                              json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+        dest = self.tmp / "full.tar.gz"
+        with mock.patch("sys.stderr", new=io.StringIO()) as errbuf:
+            rc = me_lifecycle.do_backup(self.data_dir, output=str(dest),
+                                        scope="full")
+        self.assertEqual(rc, 1)
+        self.assertFalse(dest.exists(), "refused backup must write nothing")
+        self.assertIn("EXPLICITLY BLOCKED", errbuf.getvalue())
+        self.assertTrue(self.db.is_file(), "original data untouched by refusal")
+
     def test_full_backup_refuses_while_running_or_stale(self):
         dest = self.tmp / "full.tar.gz"
         with mock.patch.object(me_lifecycle, "managed_state",
@@ -820,9 +840,13 @@ class FullBackupLive(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             with mock.patch.dict(os.environ):
                 os.environ.pop("ME_HOME_SKIP_BRIDGE_PROBE", None)
+                # Legacy H2 bridge exercise: FULL routes new tasks native
+                # (503 without upstream), so this explicitly selects the
+                # non-full dev profile where the legacy broker serves.
                 rc = me_setup.do_setup(
                     self.data_dir, "127.0.0.1", self.port,
-                    model_provider="fixture", allow_fixture_model=True)
+                    model_provider="fixture", allow_fixture_model=True,
+                    upstream_mode="core")
             self.assertEqual(rc, 0)
             bridge = me_setup.load_config(self.data_dir)["runtime_bridge"]
             if bridge.get("status") != "importable":
@@ -887,6 +911,7 @@ class FullBackupLive(unittest.TestCase):
                 rc = me_setup.do_setup(
                     self.data_dir_b, "127.0.0.1", self.port_b,
                     model_provider="fixture", allow_fixture_model=True,
+                    upstream_mode="core",
                     min_disk_mib=32)
             self.assertEqual(rc, 0)
             with mock.patch.dict(os.environ, env):

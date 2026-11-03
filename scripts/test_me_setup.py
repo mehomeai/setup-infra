@@ -119,6 +119,154 @@ class SetupHappyPath(unittest.TestCase):
                          else cfg["home_api"]["contract_status"], "home-api-v1")
 
 
+class UpstreamModeProvisioning(unittest.TestCase):
+    """P0-6: full default, sticky explicit choice, native env activation."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="me-mode-test-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        self.data_dir = self.tmp / "home"
+        self.node_patch = mock.patch.object(me_setup, "find_node", return_value=FAKE_NODE)
+        self.node_patch.start()
+        self.addCleanup(self.node_patch.stop)
+
+    def test_fresh_install_defaults_full(self):
+        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1",
+                                           free_port()), 0)
+        cfg = me_setup.load_config(self.data_dir)
+        self.assertEqual(cfg["upstream"]["mode"], "full")
+        svc = (self.data_dir / "config" / "service.env").read_text(encoding="utf-8")
+        self.assertIn("ME_UPSTREAM_MODE=full", svc)
+        # Local default maps to the supported native route (B spec: openai +
+        # container base URL; BOT_PROVIDER=ollama is rejected by the harness).
+        # The SDK requires a non-empty key even for Ollama: the documented
+        # NONSECRET placeholder constant, never a credential.
+        self.assertIn("BOT_PROVIDER=openai", svc)
+        self.assertIn("OPENAI_BASE_URL=http://host.docker.internal:11434/v1", svc)
+        self.assertIn("OPENAI_API_KEY=ollama", svc)
+        self.assertIn("BOT_MODEL=llama3.1", svc)
+
+    def test_explicit_core_sticky_on_reruns(self):
+        port = free_port()
+        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", port,
+                                           upstream_mode="core"), 0)
+        self.assertEqual(me_setup.load_config(self.data_dir)["upstream"]["mode"],
+                         "core")
+        # Rerun WITHOUT the flag preserves the explicit choice (never
+        # silently overwritten back to full).
+        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", port), 0)
+        cfg = me_setup.load_config(self.data_dir)
+        self.assertEqual(cfg["upstream"]["mode"], "core")
+        svc = (self.data_dir / "config" / "service.env").read_text(encoding="utf-8")
+        self.assertIn("ME_UPSTREAM_MODE=core", svc)
+        # Core is the computer-plane dev/partial profile, not the original
+        # Me runtime: labels must say so.
+        self.assertIn("computer-plane", cfg["upstream"]["note"])
+        self.assertNotIn("legacy", cfg["upstream"]["note"].lower())
+
+    def test_explicit_flag_overrides_previous(self):
+        port = free_port()
+        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", port), 0)
+        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", port,
+                                           upstream_mode="core"), 0)
+        self.assertEqual(me_setup.load_config(self.data_dir)["upstream"]["mode"],
+                         "core")
+
+    def test_absent_legacy_config_preserved(self):
+        port = free_port()
+        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", port), 0)
+        cfg = me_setup.load_config(self.data_dir)
+        del cfg["upstream"]
+        me_setup.write_atomic(me_setup.config_path(self.data_dir),
+                              json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+        # Rerun without a flag must NOT silently inject a mode.
+        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", port), 0)
+        cfg2 = me_setup.load_config(self.data_dir)
+        self.assertNotIn("upstream", cfg2)
+        svc = (self.data_dir / "config" / "service.env").read_text(encoding="utf-8")
+        self.assertNotIn("ME_UPSTREAM_MODE=", svc)
+
+    def test_native_harness_env_mapping(self):
+        local = me_setup.native_harness_env(
+            {"provider": "local", "name": "qwen3", "endpoint": "http://h:11434"})
+        # Non-loopback operator URL preserved as-is (private container).
+        self.assertEqual(local, {"BOT_PROVIDER": "openai", "BOT_MODEL": "qwen3",
+                                 "OPENAI_BASE_URL": "http://h:11434/v1",
+                                 "OPENAI_API_KEY": "ollama"})
+        loopback = me_setup.native_harness_env(
+            {"provider": "local", "name": "llama3.1",
+             "endpoint": "http://127.0.0.1:11434"})
+        # Loopback (host-legacy probe address) translated to the
+        # container-reachable default; NONSECRET placeholder, not a key.
+        self.assertEqual(loopback["OPENAI_BASE_URL"],
+                         "http://host.docker.internal:11434/v1")
+        self.assertEqual(loopback["OPENAI_API_KEY"], "ollama")
+        self.assertEqual(loopback["OPENAI_API_KEY"],
+                         me_setup.NATIVE_LOCAL_API_KEY_PLACEHOLDER)
+        custom_port = me_setup.native_harness_env(
+            {"provider": "local", "name": "m",
+             "endpoint": "http://localhost:11435"})
+        self.assertEqual(custom_port["OPENAI_BASE_URL"],
+                         "http://host.docker.internal:11435/v1")
+        remote = me_setup.native_harness_env(
+            {"provider": "anthropic", "name": "claude-x",
+             "endpoint": "https://api.anthropic.com"})
+        self.assertEqual(remote, {"BOT_PROVIDER": "anthropic",
+                                  "BOT_MODEL": "claude-x",
+                                  "OPENAI_BASE_URL": "https://api.anthropic.com"})
+        # Remote without endpoint: no base URL invented.
+        self.assertEqual(me_setup.native_harness_env(
+            {"provider": "openai", "name": "gpt-x"}),
+            {"BOT_PROVIDER": "openai", "BOT_MODEL": "gpt-x"})
+        self.assertEqual(me_setup.native_harness_env({"provider": "fixture"}),
+                         {})
+        with self.assertRaises(me_setup.SetupError):
+            me_setup.native_harness_env({"provider": "ollama"})
+        with self.assertRaises(me_setup.SetupError):
+            me_setup.native_harness_env({"provider": "local",
+                                         "endpoint": "not-a-url"})
+
+    def test_container_url_preserved_not_claimed_reachable(self):
+        # Explicit private-container URL preserved byte-for-byte (no
+        # translation, no reachability claim from host tags).
+        out = me_setup.native_harness_env(
+            {"provider": "local", "name": "m",
+             "endpoint": "http://ollama-computer:11434"})
+        self.assertEqual(out["OPENAI_BASE_URL"], "http://ollama-computer:11434/v1")
+        already = me_setup.native_harness_env(
+            {"provider": "local", "name": "m",
+             "endpoint": "http://host.docker.internal:11434/v1"})
+        self.assertEqual(already["OPENAI_BASE_URL"],
+                         "http://host.docker.internal:11434/v1")
+
+    def test_service_env_placeholder_marked_nonsecret(self):
+        port = free_port()
+        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", port), 0)
+        svc = (self.data_dir / "config" / "service.env").read_text(encoding="utf-8")
+        self.assertIn("NONSECRET", svc)
+        self.assertIn("harness-namespace probe", svc)
+
+    def test_home_env_activates_mode_and_native_model(self):
+        import me_lifecycle
+        port = free_port()
+        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", port), 0)
+        cfg = me_setup.load_config(self.data_dir)
+        env = me_lifecycle.build_home_env(cfg)
+        self.assertEqual(env["ME_UPSTREAM_MODE"], "full")
+        self.assertEqual(env["BOT_PROVIDER"], "openai")
+        # Container-reachable default (translated from loopback); the
+        # NONSECRET placeholder, never a real key.
+        self.assertEqual(env["OPENAI_BASE_URL"], "http://host.docker.internal:11434/v1")
+        self.assertEqual(env["OPENAI_API_KEY"], "ollama")
+        # Old tasks/data preserved across a mode switch (explicit read/resume,
+        # no silent new legacy, no deletion).
+        task = self.data_dir / "data" / "household" / "keep.json"
+        task.write_text('{"t": 1}', encoding="utf-8")
+        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", port,
+                                           upstream_mode="core"), 0)
+        self.assertEqual(task.read_text(encoding="utf-8"), '{"t": 1}')
+
+
 class UnsafePaths(unittest.TestCase):
     def test_rejected_destinations(self):
         with tempfile.NamedTemporaryFile(delete=False) as f:

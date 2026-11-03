@@ -125,6 +125,43 @@ def build_home_env(cfg: dict) -> dict:
     else:
         if models.get("endpoint"):
             env["HOME_MODEL_ENDPOINT"] = str(models["endpoint"])
+    # Native harness activation (FULL mode serves product traffic through the
+    # B runtime-wire-contract stack): the home process gets ME_UPSTREAM_MODE
+    # plus the ONE selected model as BOT_PROVIDER/BOT_MODEL/OPENAI_BASE_URL
+    # (routing only; keys inherit from the operator shell below, never baked).
+    # config.json alone is not provisioning -- this env is what activates.
+    try:
+        ups = cfg.get("upstream", None)
+    except AttributeError:
+        ups = None
+    ups_mode = ""
+    if isinstance(ups, dict):
+        ups_mode = str(ups.get("mode", "") or "").strip().lower()
+    if ups_mode in ("full", "core"):
+        env["ME_UPSTREAM_MODE"] = ups_mode
+    try:
+        for k, v in me_setup.native_harness_env(models).items():
+            env[k] = v
+    except me_setup.SetupError:
+        pass  # fixture/unknown: no native mapping (verified at setup/checks)
+    # Remote generic key binding (trusted launch ONLY, never persisted):
+    # the native container reads the PROVIDER-SPECIFIC key (OPENAI_API_KEY /
+    # ANTHROPIC_API_KEY), so bind the operator's generic
+    # ME_RUNTIME_MODEL_API_KEY to it when the specific one is unset.
+    # Explicit provider-specific shell value always wins. Absent entirely:
+    # left unset (the model check / doctor report the honest
+    # missing-native-key gate instead of verifying a key the container
+    # never receives). Values live in process env only -- never files,
+    # never logs (redacted).
+    if provider == "local":
+        if os.environ.get("OPENAI_API_KEY", "").strip():
+            env["OPENAI_API_KEY"] = os.environ["OPENAI_API_KEY"].strip()
+    elif provider in ("openai", "anthropic"):
+        target = "OPENAI_API_KEY" if provider == "openai" else "ANTHROPIC_API_KEY"
+        if os.environ.get(target, "").strip():
+            env[target] = os.environ[target].strip()
+        elif os.environ.get("ME_RUNTIME_MODEL_API_KEY", "").strip():
+            env[target] = os.environ["ME_RUNTIME_MODEL_API_KEY"].strip()
     if provider in ("openai", "anthropic") and models.get("allow_remote"):
         env["ME_RUNTIME_ALLOW_REMOTE"] = "1"
     if provider == "openai" and models.get("use_responses_api"):
@@ -1258,6 +1295,21 @@ def do_backup_full(data_dir: Path, *, output: str | None = None) -> int:
     gate = full_stopped_gate(data_dir, cfg, "full backup")
     if gate is not None:
         return gate
+    # Upstream-volumes coverage: the SQLite-only full archive must NEVER be
+    # presented as covering Postgres/self-hosted-Intelligence volumes. When
+    # the config declares upstream volumes (A storage contract), full backup
+    # is EXPLICITLY BLOCKED until the scope is extended per that contract.
+    declared_volumes = cfg.get("volumes") or {}
+    if isinstance(declared_volumes, dict) and declared_volumes:
+        names = ",".join(sorted(declared_volumes.keys()))
+        err(f"error: full backup EXPLICITLY BLOCKED: config declares upstream "
+            f"volumes ({names}) that the SQLite-only archive does not cover "
+            f"(no Postgres/Intelligence snapshot support yet -- see the A "
+            f"storage contract results/datastorage-contract.json). Refusing "
+            f"rather than labelling an incomplete archive as full. Provision "
+            f"the supported upstream backup path per the storage contract; "
+            f"the archive scope stays explicitly sqlite+tasks+household.")
+        return 1
     src_db = Path(cfg["service"]["db_path"])
     if not src_db.is_file():
         err(f"error: no home database yet at {src_db}; start the service (or seed) first")
@@ -1347,6 +1399,13 @@ def do_backup_full(data_dir: Path, *, output: str | None = None) -> int:
             "household": manifest_house,
             "counts": {"tasks": len(manifest_tasks), "household": len(manifest_house)},
             "total_bytes": task_bytes + house_bytes,
+            "coverage": ["sqlite", "tasks", "household"],
+            "uncovered_volumes": [],
+            "coverage_note": ("SQLite-only scope: covers the home SQLite db, "
+                              "per-task workspaces and household files. Does NOT "
+                              "cover upstream Postgres/self-hosted-Intelligence "
+                              "volumes (none declared in config; blocked explicitly "
+                              "if ever declared)."),
             "excludes": ["config/", "config/service.env", "logs/", "secrets/",
                          "run/", "backups/", "tmp/",
                          "operator environment, tunnel credential files, "
@@ -2279,6 +2338,28 @@ def do_restore_full(data_dir: Path, *, source: str, confirm_destructive: bool = 
         if not manifest.get("installation_id"):
             err("error: archive manifest has no installation_id; nothing touched")
             return 1
+        # Upstream-volumes coverage: refuse to present a SQLite-only restore
+        # as complete when the live config declares upstream volumes the
+        # archive does not cover.
+        try:
+            _data_dir_cfg, _cfg_now = load_cfg(data_dir)
+        except me_setup.SetupError as exc:
+            err(f"error: {exc}")
+            return 2
+        _declared = _cfg_now.get("volumes") or {}
+        if isinstance(_declared, dict) and _declared:
+            _covered = set(manifest.get("coverage") or ["sqlite", "tasks", "household"])
+            _need = {str(v.get("scope", k)) for k, v in _declared.items()
+                     if isinstance(v, dict)} or set(_declared.keys())
+            _missing = sorted(_need - _covered)
+            if _missing:
+                err(f"error: full restore EXPLICITLY BLOCKED: config declares "
+                    f"upstream volumes with scopes ({','.join(_missing)}) that "
+                    f"this archive does not cover (archive coverage: "
+                    f"{','.join(sorted(manifest.get('coverage') or [])) or 'sqlite-only'}). "
+                    f"Refusing rather than restoring an incomplete platform. "
+                    f"Extend the backup scope per the A storage contract first.")
+                return 1
         expected: dict[str, dict] = {}
         for key in ("tasks", "household"):
             items = manifest.get(key)
