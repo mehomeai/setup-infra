@@ -18,6 +18,9 @@ for name in filter(None, tracked):
         errors.append(f'Remove tracked environment secrets file: {name}')
     if p.name in ('id_rsa', 'id_ed25519') or p.suffix in ('.p12', '.pfx', '.key'):
         errors.append(f'Remove tracked private key file: {name}')
+    if p.name in ('backend-home-token.json', 'coordinator.json'):
+        errors.append(f'Remove tracked coordinator credentials file: {name} '
+                      '(the 0600 home_token file lives outside git, never tracked)')
     try:
         content = p.read_text()
     except (UnicodeDecodeError, OSError):
