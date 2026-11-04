@@ -7,9 +7,9 @@ Learn about the vision at [Me — Your intelligence. Yours.](https://mehomeai.re
 ## Status
 
 This repository provides the rerunnable development setup and managed lifecycle
-for the Me home service (implemented on review branch
-`feat/home-agent-foundation`; committed/pushed; draft PR #1 pending
-review/checks; no merge to protected `main`, no deployed release):
+for the Me home service (implemented on `main`: foundation
+PR #1; upstream agent infrastructure PR #2, merged 2026-11-03; no
+deployed release):
 `scripts/me_setup.py` (prerequisites, config, non-secret environment) and
 `scripts/me_lifecycle.py` (managed start/status/stop, home-CLI bootstrap,
 cloud-coordination activation (`coordinator prepare/activate/status/check`,
