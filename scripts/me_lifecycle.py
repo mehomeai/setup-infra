@@ -1843,7 +1843,7 @@ def _rollback_moves(moves: list, set_config: dict | None = None) -> list:
     return errors
 
 
-def _reconcile_intents(journal: dict) -> list:
+def _reconcile_intents(journal: dict, data_dir: Path) -> list:
     """Reconcile write-ahead intents (done=False) against the filesystem.
 
     A crash can land between the durable intent write and the rename, or
@@ -1861,6 +1861,18 @@ def _reconcile_intents(journal: dict) -> list:
     nothing to undo -- the preservation rollback already restores prestate.
     Returns problem strings (empty when every intent is classifiable).
     """
+    # The ephemeral staging tree is <data_dir>/tmp only (the restore staging
+    # tree always lives at <data_dir>/tmp/.full-restore-<tag> /
+    # .full-backup-<tag>). A bare "/tmp/" substring test is wrong: on hosts
+    # where the whole data_dir lives under /tmp (Linux dev/CI), preservation
+    # renames of live data would be misclassified as ephemeral, the completed
+    # move would never be flipped to done=True, and recovery would strand
+    # the data in the pre-restore dir.
+    staging_root = str(data_dir / "tmp").replace("\\", "/") + "/"
+
+    def _ephemeral(src_s: str) -> bool:
+        return src_s.replace("\\", "/").startswith(staging_root)
+
     problems: list = []
     for mv in journal.get("moves", []):
         if mv.get("done"):
@@ -1875,10 +1887,11 @@ def _reconcile_intents(journal: dict) -> list:
             continue
         if d and not s:
             src_s = str(src)
-            # Staging/ready sources are ephemeral: if the source is under a
-            # tmp staging dir that no longer exists, the install never landed
-            # (or staging was already cleaned); do not resurrect it.
-            if ("/tmp/" in src_s.replace("\\", "/")
+            # Staging/ready sources are ephemeral: if the source is under the
+            # data_dir/tmp staging tree that no longer exists, the install
+            # never landed (or staging was already cleaned); do not
+            # resurrect it.
+            if (_ephemeral(src_s)
                     or ".full-restore-" in src_s
                     or "/.full-backup-" in src_s):
                 continue
@@ -1895,7 +1908,7 @@ def _reconcile_intents(journal: dict) -> list:
         # the install never happened -- drop it, preservation rollback covers
         # prestate. Otherwise live data may be missing: block.
         src_s = str(mv.get("src", ""))
-        if ("/tmp/" in src_s.replace("\\", "/")
+        if (_ephemeral(src_s)
                 or ".full-restore-" in src_s):
             continue
         problems.append(
@@ -1939,7 +1952,7 @@ def _rollback_journal_moves(journal_path: Path, journal: dict) -> list:
     (fsync file + parent dir) before any rollback mutation is claimed.
     """
     _reconcile_config_intent(journal)
-    intent_problems = _reconcile_intents(journal)
+    intent_problems = _reconcile_intents(journal, journal_path.parent.parent)
     try:
         _durable_write_json(journal_path, journal, mode=0o600)
     except OSError:
