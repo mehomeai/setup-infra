@@ -1020,6 +1020,13 @@ class TurnIOCases(unittest.TestCase):
     def test_session_latched_despite_tail_eviction(self):
         # Initial session event followed by >262144B of noise: the bounded
         # EOF tail evicts the session line, but the streaming latch keeps it.
+        # max_output is sized so the tail (128KB) is still evicted by the
+        # 400KB of noise while the flood cap (4x max_output = 512KB) stays
+        # above the total output: with a small max_output the flood
+        # watchdog legitimately races the child (it fires whenever the
+        # drain is still mid-flood at a poll tick), which made this test
+        # flaky under load (rc=-15). The latch, not the watchdog, is the
+        # behavior under test here; the flood cap has its own test below.
         body = ('import json,sys\n'
                 'sys.stdout.write(json.dumps({"sessionID": "ses-latch-1"})+"\\n")\n'
                 'sys.stdout.write("x" * 400000 + "\\n")\n'
@@ -1027,9 +1034,12 @@ class TurnIOCases(unittest.TestCase):
         fake = self._fake_bin("fake-latch", body)
         rc, out, serr, sess = me_supervisor.run_opencode_turn(
             binary=fake, workspace=self.ws, prompt="p", session_id="",
-            timeout_s=30, max_output=4096, data_dir=self.dd)
+            timeout_s=30, max_output=131072, data_dir=self.dd)
         self.assertEqual(rc, 0)
         self.assertEqual(sess, "ses-latch-1")
+        # The session line really was evicted from the returned tail, so
+        # the ID could only have come from the streaming latch.
+        self.assertNotIn("ses-latch-1", out)
 
     def test_exited_leader_holding_pipe_no_deadlock(self):
         # Leader exits immediately; a TERM-ignoring grandchild INHERITS

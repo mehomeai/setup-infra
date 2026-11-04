@@ -954,12 +954,22 @@ class TrickleDeadlineTests(unittest.TestCase):
         backend_url = self._start_trickle(mode="body201")
         ticket = self._mint_ticket(backend_url)
         activate_via_cli(ticket, self.data_dir, "--timeout-ms", "1000")
-        time.sleep(0.5)
+        # The helper is terminated by the CLI, but its group teardown
+        # (TERM, grace, KILL, reap) can outlast a fixed sleep under load;
+        # poll for disappearance with a bounded wait instead of asserting
+        # after one 0.5s sleep (which flaked under full-suite load). The
+        # assertion is unchanged: no helper may persist.
         try:
-            ps = _sp.run(["pgrep", "-f", "transport-helper"], capture_output=True,
-                         text=True, timeout=5)
-            self.assertEqual(ps.stdout.strip(), "",
-                             msg=f"orphan transport helper: {ps.stdout.strip()}")
+            seen = ""
+            deadline = time.monotonic() + 5.0
+            while True:
+                ps = _sp.run(["pgrep", "-f", "transport-helper"],
+                             capture_output=True, text=True, timeout=5)
+                seen = ps.stdout.strip()
+                if not seen or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+            self.assertEqual(seen, "", msg=f"orphan transport helper: {seen}")
         except FileNotFoundError:
             pass
 
