@@ -287,11 +287,113 @@ def default_models() -> dict:
     return build_models()
 
 
+# Native harness local route (B canonical local-model contract): the
+# OpenAI-compatible SDK requires a NON-EMPTY key even for Ollama, so the
+# selected-native env carries this documented NONSECRET placeholder constant
+# -- never a real credential, never personal, baked nowhere secret lives.
+# Real remote keys stay in the operator shell and are bound at trusted
+# launch only (see me_lifecycle.build_home_env).
+NATIVE_LOCAL_API_KEY_PLACEHOLDER = "ollama"
+# Default container-reachable host for translated loopback endpoints.
+# UNVERIFIED from setup: the A doctor owns the harness-namespace probe.
+NATIVE_CONTAINER_HOST = "host.docker.internal"
+
+
+def native_harness_env(models: dict) -> dict[str, str]:
+    """ONE selected model mapped to the native harness env (non-secret).
+
+    The native harness (B runtime-wire-contract: BOT_PROVIDER/BOT_MODEL/
+    OPENAI_BASE_URL + provider keys from the operator shell) is the stack
+    that actually serves product traffic in FULL mode. Supported local route
+    per B canonical local-model contract: BOT_PROVIDER=openai +
+    OPENAI_BASE_URL=<container-reachable base>/v1 + OPENAI_API_KEY=ollama.
+    The SDK requires a non-empty key even for Ollama, so "ollama" is a
+    documented NONSECRET placeholder constant -- NOT a credential. Real
+    remote keys are NEVER baked here (operator shell only; local exception
+    documented). BOT_PROVIDER=ollama is NOT a supported config and is
+    rejected by the harness config check. Fixture has no native mapping
+    (synthetic tests only).
+
+    Container reachability: a loopback HOME_MODEL_ENDPOINT (host-legacy
+    probe address) is translated to host.docker.internal for the container
+    (port preserved). An explicit non-loopback operator URL (private Ollama
+    container / custom base) is preserved as-is. Setup does NOT claim the
+    translated URL is reachable from the container namespace -- host tags
+    cannot prove that; the A doctor owns the actual harness-namespace probe
+    (see setup-wire-contract.json handoff to A).
+    """
+    import urllib.parse as _urlparse
+    models = models or {}
+    provider = str(models.get("provider", "local") or "local").strip().lower()
+    if provider == "fixture":
+        return {}
+    if provider not in ("local", "openai", "anthropic"):
+        raise SetupError(
+            f"native harness mapping: unsupported provider {provider!r} "
+            "(must be local|openai|anthropic)")
+    name = str(models.get("name", "") or "").strip() or "llama3.1"
+    if provider == "local":
+        endpoint = str(models.get("endpoint", "") or "").strip().rstrip("/")
+        if not endpoint:
+            endpoint = "http://127.0.0.1:11434"
+        if not endpoint.startswith(("http://", "https://")):
+            raise SetupError(
+                f"native harness mapping: local endpoint {endpoint!r} "
+                "malformed (must be http(s)://host:port)")
+        base = _container_base_url(endpoint)
+        if not base.endswith("/v1"):
+            base += "/v1"
+        return {"BOT_PROVIDER": "openai", "BOT_MODEL": name,
+                "OPENAI_BASE_URL": base,
+                "OPENAI_API_KEY": NATIVE_LOCAL_API_KEY_PLACEHOLDER}
+    out = {"BOT_PROVIDER": provider, "BOT_MODEL": name}
+    endpoint = str(models.get("endpoint", "") or "").strip().rstrip("/")
+    if endpoint:
+        # Operator-supplied base URL preserved as-is (container must already
+        # reach it; only loopback translation applies to the local route).
+        out["OPENAI_BASE_URL"] = endpoint
+    return out
+
+
+def _container_base_url(endpoint: str) -> str:
+    """Translate a host-legacy base URL to a container-reachable default.
+
+    Loopback hosts (127.0.0.1/localhost/::1 -- the host-legacy probe
+    address kept in HOME_MODEL_ENDPOINT) become host.docker.internal (port
+    and path preserved): 127.0.0.1 is the container's own loopback and can
+    never reach host Ollama. Anything else is an explicit operator
+    container URL and is preserved byte-for-byte. UNVERIFIED: setup cannot
+    prove container-namespace reachability from host tags; the A doctor
+    owns that probe.
+    """
+    import urllib.parse as _urlparse
+    parts = _urlparse.urlsplit(endpoint)
+    host = parts.hostname or ""
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return endpoint
+    netloc = parts.netloc
+    userinfo = ""
+    hostport = netloc
+    if "@" in netloc:
+        userinfo, _, hostport = netloc.rpartition("@")
+        userinfo += "@"
+    if hostport.startswith("["):
+        # IPv6 literal: [::1]:port
+        _, _, rest = hostport.partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+    else:
+        _, _, port = hostport.partition(":")
+    rebuilt = userinfo + NATIVE_CONTAINER_HOST + (":" + port if port else "")
+    return _urlparse.urlunsplit(
+        (parts.scheme, rebuilt, parts.path, parts.query, parts.fragment))
+
+
 def render_service_env(*, db_path: Path, host: str, port: int,
                        runtime_argv: list | None = None, runtime_cwd: str = "",
                        models: dict | None = None,
                        coordinator: dict | None = None,
-                       notifications: dict | None = None) -> str:
+                       notifications: dict | None = None,
+                       upstream_mode: str | None = None) -> str:
     """Render config/service.env. Non-secret values only, shell-safe quoting.
 
     Every value is shlex.quote'd, so paths with spaces round-trip through
@@ -299,6 +401,11 @@ def render_service_env(*, db_path: Path, host: str, port: int,
     appear here: the operator exports them in their own shell (see comments).
     Absent/false host flags are omitted (H2/H3 treat absent as false); only
     explicit opt-ins set values.
+
+    The home process is ACTIVATED from this file: ME_UPSTREAM_MODE selects
+    the A upstream profile, and the native harness vars (BOT_PROVIDER/
+    BOT_MODEL/OPENAI_BASE_URL, non-secret routing only) carry the ONE
+    selected FULL model -- config.json alone is not provisioning.
     """
     import shlex as _shlex
     models = models or default_models()
@@ -320,8 +427,32 @@ def render_service_env(*, db_path: Path, host: str, port: int,
         lines.append(f"HOME_MODEL_NAME={_shlex.quote(str(models['name']))}")
     if provider != "fixture" and models.get("endpoint"):
         lines.append(f"HOME_MODEL_ENDPOINT={_shlex.quote(str(models['endpoint']))}")
+    # Native harness activation (FULL mode serves product traffic through the
+    # B runtime-wire-contract stack, not the legacy local probe): ME_UPSTREAM_MODE
+    # selects the A upstream profile, and BOT_* carries the ONE selected model
+    # (routing only; keys stay in the operator shell, never baked).
+    if upstream_mode in ("full", "core"):
+        lines.append(f"ME_UPSTREAM_MODE={_shlex.quote(upstream_mode)}")
+    try:
+        native = native_harness_env(models)
+    except SetupError as exc:
+        raise SetupError(f"service.env: {exc}")
+    if native:
+        lines.append("# Selected NATIVE model (B canonical route; what FULL "
+                     "production serves). Container reachability of "
+                     "OPENAI_BASE_URL is UNVERIFIED here (A doctor owns the "
+                     "harness-namespace probe); loopback was translated to "
+                     "host.docker.internal, explicit operator URLs preserved.")
+    for k, v in native.items():
+        if k == "OPENAI_API_KEY" and v == NATIVE_LOCAL_API_KEY_PLACEHOLDER:
+            lines.append(f"{k}={_shlex.quote(str(v))}  # NONSECRET local-route "
+                         "placeholder constant (SDK requires non-empty key; "
+                         "not a credential -- real keys stay in operator shell)")
+        else:
+            lines.append(f"{k}={_shlex.quote(str(v))}")
     if provider == "fixture" and models.get("allow_fixture"):
         lines.append("HOME_ALLOW_FIXTURE_MODEL=1  # synthetic tests only, never household data")
+        lines.append("# (fixture has no native BOT_* mapping: synthetic only, never production)")
     if provider in ("openai", "anthropic") and models.get("allow_remote"):
         lines.append("ME_RUNTIME_ALLOW_REMOTE=1  # explicit operator opt-in")
     if (provider == "openai" and models.get("use_responses_api")):
@@ -778,6 +909,13 @@ def load_config(data_dir: Path) -> dict:
         pid = (notif.get("expo_project_id") or "")
         if pid and (not isinstance(pid, str) or len(pid) > 128):
             raise SetupError(f"existing config at {path} has invalid notifications.expo_project_id")
+    ups = cfg.get("upstream")
+    if ups is not None:
+        if not isinstance(ups, dict):
+            raise SetupError(f"existing config at {path} has invalid upstream section")
+        if str(ups.get("mode", "full")).strip().lower() not in ("full", "core"):
+            raise SetupError(f"existing config at {path} has invalid upstream.mode "
+                             "(must be full|core)")
     return cfg
 
 
@@ -793,7 +931,8 @@ def build_config(*, data_dir: Path, host: str, port: int,
                  coordinator_allow_http_loopback: bool = False,
                  coordinator_enabled: bool = False,
                  notifications_enabled: bool = False,
-                 expo_project_id: str = "") -> dict:
+                 expo_project_id: str = "",
+                 upstream_mode: str | None = "full") -> dict:
     db_path = data_dir / "data" / "home.sqlite"  # H1 `--db` target (single-host SQLite)
     import shlex as _shlex
     node_ref = _shlex.quote(node_bin) if node_bin and " " in node_bin else (node_bin or "node")
@@ -837,6 +976,21 @@ def build_config(*, data_dir: Path, host: str, port: int,
         "runtime_bridge": runtime_bridge or {"contract": BRIDGE_CONTRACT,
                                              "status": "unprobed"},
         "models": models or default_models(),
+        **({"upstream": {
+            # Production config derives FULL by default (user steering: FULL
+            # upstream OpenBot platform + licensed self-hosted Intelligence is
+            # the primary integration). Core is the upstream computer-plane
+            # dev/partial profile (per-user computers via supervisor) -- NOT
+            # the original Me task-broker runtime -- and never production
+            # READY. upstream_mode=None (absent pre-migration config
+            # preserved) omits this section entirely: the supervisor then
+            # parks NEEDS_INPUT until the operator selects explicitly.
+            "mode": upstream_mode,
+            "note": ("full (default): FULL upstream platform + licensed "
+                     "self-hosted Intelligence primary; core: upstream "
+                     "computer-plane dev/partial (per-user computers, not "
+                     "the original Me runtime), never production READY"),
+        }} if upstream_mode in ("full", "core") else {}),
         "home_api": {
             # H1 (infra-server) owns this contract; setup only records readiness.
             # Human-readable: CONTRACT_REL_PATH (authoritative for H1).
@@ -977,7 +1131,8 @@ def do_setup(data_dir: Path, host: str, port: int, adopt_service_id: bool = Fals
              coordinator_allow_http_loopback: bool = False,
              coordinator_enabled: bool = False,
              notifications_enabled: bool = False,
-             expo_project_id: str = "") -> int:
+             expo_project_id: str = "",
+             upstream_mode: str | None = None) -> int:
     results = check_prerequisites(data_dir, host, port, node_bin=node_bin,
                                   min_disk_mib=min_disk_mib)
     failed = [(n, d) for n, ok, d in results if not ok]
@@ -1010,6 +1165,16 @@ def do_setup(data_dir: Path, host: str, port: int, adopt_service_id: bool = Fals
                                     or os.environ.get("ME_HOME_COORDINATOR_CREDENTIALS_FILE", "")
                                     or "").strip()
     expo_project_id = (expo_project_id or os.environ.get("HOME_EXPO_PROJECT_ID", "") or "").strip()[:128]
+    # Upstream mode: explicit flag wins; else preserve the existing explicit
+    # mode on reruns (never silently overwrite); fresh installs default full.
+    # Core is the upstream computer-plane dev/partial profile, NOT the
+    # original Me task-broker runtime. Absent pre-migration configs stay
+    # absent unless the operator chooses (supervisor parks NEEDS_INPUT).
+    _flag_mode = (upstream_mode or "").strip().lower() if upstream_mode else ""
+    if _flag_mode and _flag_mode not in ("full", "core"):
+        log("error: --upstream-mode must be full|core (default full; "
+            "core is computer-plane dev/partial, never production READY)")
+        return 2
     if public_home_url:
         try:
             public_home_url = validate_https_url(
@@ -1104,6 +1269,20 @@ def do_setup(data_dir: Path, host: str, port: int, adopt_service_id: bool = Fals
     eff_notif_enabled = bool(notifications_enabled or _prev_notif.get("enabled", False))
     if not expo_project_id:
         expo_project_id = str(_prev_notif.get("expo_project_id", "") or "")
+    _prev_ups = (existing or {}).get("upstream", None)
+    _prev_mode = ""
+    if isinstance(_prev_ups, dict):
+        _prev_mode = str(_prev_ups.get("mode", "") or "").strip().lower()
+        if _prev_mode not in ("full", "core"):
+            _prev_mode = ""
+    if _flag_mode:
+        eff_mode: str | None = _flag_mode
+    elif existing is None:
+        eff_mode = "full"  # fresh install default (user steering: FULL primary)
+    elif _prev_mode:
+        eff_mode = _prev_mode  # sticky explicit choice on reruns
+    else:
+        eff_mode = None  # absent pre-migration config preserved (no silent default)
     cfg = build_config(data_dir=data_dir, host=host, port=port,
                        installation_id=installation_id, now=now, node_found=node_detail,
                        installation_source=installation_source,
@@ -1118,7 +1297,8 @@ def do_setup(data_dir: Path, host: str, port: int, adopt_service_id: bool = Fals
                        coordinator_allow_http_loopback=eff_allow_lb,
                        coordinator_enabled=eff_coord_enabled,
                        notifications_enabled=eff_notif_enabled,
-                       expo_project_id=expo_project_id)
+                       expo_project_id=expo_project_id,
+                       upstream_mode=eff_mode)
     cfg["created_at"] = created
     write_atomic(cfg_file, json.dumps(cfg, indent=2, sort_keys=True) + "\n")
 
@@ -1131,7 +1311,8 @@ def do_setup(data_dir: Path, host: str, port: int, adopt_service_id: bool = Fals
                                   runtime_argv=bridge_argv,
                                   runtime_cwd=bridge_cwd, models=models,
                                   coordinator=cfg.get("coordinator"),
-                                  notifications=cfg.get("notifications"))
+                                  notifications=cfg.get("notifications"),
+                                  upstream_mode=eff_mode)
     write_atomic(data_dir / "config" / "service.env", env_text)
 
     # Restrict secrets dir on every run (defensive; never touches household data).
@@ -1376,6 +1557,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--expo-project-id", default=os.environ.get("HOME_EXPO_PROJECT_ID", ""),
                    help="optional public Expo project id (app config, never a "
                         "credential; access token stays in operator shell)")
+    s.add_argument("--upstream-mode", default=None, choices=("full", "core"),
+                   help="upstream platform profile recorded in config "
+                        "(default full on fresh installs: FULL OpenBot + "
+                        "licensed self-hosted Intelligence primary; core is "
+                        "the upstream computer-plane dev/partial profile, "
+                        "never production READY; omitted on reruns preserves "
+                        "the existing explicit choice)")
     c = sub.add_parser("check", help="validate prereqs and existing config")
     c.add_argument("--data-dir", default=default_dir)
     v = sub.add_parser("config-show", help="print current config (no secrets by design)")
@@ -1413,7 +1601,8 @@ def main(argv: list[str] | None = None) -> int:
                             coordinator_allow_http_loopback=args.coordinator_allow_http_loopback,
                             coordinator_enabled=args.coordinator_enabled,
                             notifications_enabled=args.notifications_enabled,
-                            expo_project_id=args.expo_project_id or "")
+                            expo_project_id=args.expo_project_id or "",
+                            upstream_mode=args.upstream_mode)
         if args.cmd == "check":
             return do_check(Path(args.data_dir))
         if args.cmd == "config-show":

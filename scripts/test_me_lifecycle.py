@@ -652,9 +652,13 @@ class HomeApiIntegration(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             with mock.patch.dict(os.environ):
                 os.environ.pop("ME_HOME_SKIP_BRIDGE_PROBE", None)
+                # Legacy H2 bridge smoke test: FULL routes new tasks native
+                # (503 without upstream), so this explicitly selects the
+                # non-full dev profile where the legacy broker serves.
                 rc = me_setup.do_setup(
                     self.data_dir, "127.0.0.1", self.port,
-                    model_provider="fixture", allow_fixture_model=True)
+                    model_provider="fixture", allow_fixture_model=True,
+                    upstream_mode="core")
             self.assertEqual(rc, 0)
             bridge = me_setup.load_config(self.data_dir)["runtime_bridge"]
             if bridge.get("status") != "importable":
@@ -727,6 +731,54 @@ class HomeEnvConfig(unittest.TestCase):
         self.assertEqual(env["HOME_MODEL_ENDPOINT"], "http://127.0.0.1:11434")
         self.assertNotIn("HOME_ALLOW_FIXTURE_MODEL", env)
         self.assertNotIn("ME_RUNTIME_ALLOW_REMOTE", env)
+        self.assertNotIn("ME_RUNTIME_MODEL_API_KEY", env)
+        # Native local route: container base + NONSECRET placeholder (never
+        # a personal key; SDK requires non-empty).
+        self.assertEqual(env["OPENAI_BASE_URL"], "http://host.docker.internal:11434/v1")
+        self.assertEqual(env["OPENAI_API_KEY"], "ollama")
+
+    def test_local_placeholder_is_not_a_credential(self):
+        # The placeholder is the documented constant, present even with no
+        # operator keys anywhere; nothing personal is read or fabricated.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OPENAI_API_KEY", None)
+            os.environ.pop("ME_RUNTIME_MODEL_API_KEY", None)
+            cfg = self._setup()
+            env = me_lifecycle.build_home_env(cfg)
+        self.assertEqual(env["OPENAI_API_KEY"], "ollama")
+        raw = (self.data_dir / "config" / "config.json").read_text(encoding="utf-8")
+        for line in (self.data_dir / "config" / "service.env").read_text(
+                encoding="utf-8").splitlines():
+            if line.startswith("OPENAI_API_KEY=") and "ollama" not in line:
+                raise AssertionError("local key must be the placeholder only")
+
+    def test_remote_generic_key_binds_provider_key_at_launch(self):
+        cfg = self._setup(model_provider="openai", model_name="gpt-4o-mini",
+                          allow_remote_model=True)
+        # Generic-only operator key binds to the native provider key in the
+        # spawned process env (never files, never logs).
+        with mock.patch.dict(os.environ, {"ME_RUNTIME_MODEL_API_KEY": "op-key-1",
+                                           "OPENAI_API_KEY": ""}):
+            os.environ.pop("OPENAI_API_KEY", None)
+            env = me_lifecycle.build_home_env(cfg)
+        self.assertEqual(env["OPENAI_API_KEY"], "op-key-1")
+        raw = (self.data_dir / "config" / "config.json").read_text(encoding="utf-8")
+        self.assertNotIn("op-key-1", raw)
+        svc = (self.data_dir / "config" / "service.env").read_text(encoding="utf-8")
+        self.assertNotIn("op-key-1", svc)
+        # Explicit provider-specific shell value wins over the generic.
+        with mock.patch.dict(os.environ, {"ME_RUNTIME_MODEL_API_KEY": "op-key-1",
+                                           "OPENAI_API_KEY": "op-key-2"}):
+            env2 = me_lifecycle.build_home_env(cfg)
+        self.assertEqual(env2["OPENAI_API_KEY"], "op-key-2")
+
+    def test_remote_missing_key_left_unset_for_honest_gate(self):
+        cfg = self._setup(model_provider="anthropic", allow_remote_model=True)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            os.environ.pop("ME_RUNTIME_MODEL_API_KEY", None)
+            env = me_lifecycle.build_home_env(cfg)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("ME_RUNTIME_MODEL_API_KEY", env)
 
     def test_fixture_requires_explicit_opt_in(self):
