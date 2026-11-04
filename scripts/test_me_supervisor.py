@@ -442,10 +442,15 @@ class DoctorIntegrityCases(unittest.TestCase):
 
     def _ready_report(self, **over) -> dict:
         # Mirrors the ACTUAL live doctor schema (infra-server
-        # src/upstream-doctor.mjs): top-level protocol + versioned
-        # full-evidence contract marker + every required evidence name with
-        # verified values. Minimal/forged variants are built by deleting
-        # from this (see tests below) -- never by inventing shapes.
+        # src/upstream-doctor.mjs) AND the final setup-doctor contract
+        # (ready_evidence_required): top-level protocol + versioned
+        # full-evidence contract marker + every required evidence name,
+        # INCLUDING every nested field the contract names (sourcePin
+        # .deployed, nativeAuth fleet/roleGate, intelligence entitlement/
+        # licensed/sdkVersion, model.selectedServed, postgres reachable/
+        # live, upstreamServer.capabilities, telemetry.enforced, datastore
+        # bindings + recorded modes). Minimal/forged variants are built by
+        # deleting from this (see tests below) -- never by inventing shapes.
         checks: dict = {
             "doctor_contract": me_supervisor.DOCTOR_CONTRACT_REQUIRED,
             "mode": "full",
@@ -453,12 +458,24 @@ class DoctorIntegrityCases(unittest.TestCase):
                          "ref": me_supervisor.UPSTREAM_PIN},
             "sourcePin": {"repo": me_supervisor.UPSTREAM_REPO,
                           "ref": me_supervisor.UPSTREAM_PIN,
-                          "files": 42, "verified": "lock-format"},
+                          "files": 42, "verified": "lock-format",
+                          "deployed": {"configured": True,
+                                       "head": me_supervisor.UPSTREAM_PIN,
+                                       "filesOk": 40,
+                                       "manifestOk": 3,
+                                       "patchApplied": True,
+                                       "ok": True}},
             "config": {"missing": [], "gate": "pass"},
             "supervisor": {"url": "http://127.0.0.1:4500",
                            "health": {"status": "ok", "docker": True},
                            "list": "ok (1)"},
             "perUserBoundary": "id-rules-loaded (names.ts ALLOWED)",
+            "nativeAuth": {"probed": True, "authenticated": True,
+                           "agents": 2, "perPersonRoster": True,
+                           "fleet": {"computers": 2,
+                                     "isolation": "per-person",
+                                     "personKeys": 2},
+                           "roleGate": "user-denied", "perPerson": True},
             "versions": {"computerImage": "openbot-agent-computer:pinned",
                          "namespace": "openbot",
                          "checkout": "/opt/openbot",
@@ -467,19 +484,45 @@ class DoctorIntegrityCases(unittest.TestCase):
                         "managedOptIn": False,
                         "note": "licensed self-hosted Intelligence"},
             "upstreamServer": {"url": "http://127.0.0.1:3001",
-                               "health": {"status": "ok"}},
+                               "health": {"status": "ok"},
+                               "capabilities": {"mode": "full",
+                                                "durableHistory": True}},
             "postgres": {"configured": True,
-                         "binding": "postgres-data:/var/lib/postgresql/data"},
-            "model": {"provider": "local",
-                      "endpoint": "http://127.0.0.1:11434", "reachable": True},
-            "intelligence": {"apiUrl": "http://127.0.0.1:4201",
-                             "gatewayWsUrl": "ws://127.0.0.1:4401",
-                             "keyPresent": True, "selfHosted": True,
-                             "reachable": True},
+                         "binding": "postgres-data:/var/lib/postgresql/data "
+                                    "(pgvector/pg17)",
+                         "reachable": True,
+                         "live": "127.0.0.1:5432 answers TCP (SQL layer "
+                                 "proven by migrate + server /health)"},
+            # Native model single source (BOT_PROVIDER/BOT_MODEL): the
+            # local Ollama route is provider "openai" with a local
+            # OPENAI_BASE_URL and no key (keyEnv present, key not needed).
+            "model": {"provider": "openai", "model": "llama3.1",
+                      "endpoint": "http://host.docker.internal:11434/v1",
+                      "keyEnv": "OPENAI_API_KEY", "keyPresent": False,
+                      "served": ["llama3.1"], "selectedServed": True},
+            "intelligence": {"apiHost": "127.0.0.1:4201",
+                             "gatewayHost": "127.0.0.1:4401",
+                             "keyPresent": True,
+                             "licenseTokenPresent": True,
+                             "selfHosted": True,
+                             "entitlement": "ready",
+                             "sdkVersion":
+                                 me_supervisor.DOCTOR_INTELLIGENCE_SDK_VERSION,
+                             "licensed": True},
             "telemetry": {"doNotTrack": "1",
                           "disabled": "1",
-                          "product": "0"},
-            "datastore": {"volumes": ["postgres-data:/var/lib/postgresql/data"]},
+                          "product": "0",
+                          "enforced": "upstream telemetry must stay "
+                                      "disabled (DO_NOT_TRACK=1 or "
+                                      "COPILOTKIT_TELEMETRY_DISABLED=1)"},
+            "datastore": {"volumes": ["postgres-data:/var/lib/postgresql/data",
+                                      "agent-workspace:/workspace",
+                                      "agent-profiles:/profiles"],
+                          "note": "full backup must include Postgres + "
+                                  "Intelligence threads + computer files; "
+                                  "see results/datastorage-contract.json",
+                          "home-data": "/opt/me/data (mode 700)",
+                          "checkout": "/opt/openbot (mode 755)"},
             "probe": True,
         }
         checks.update(over.get("checks", {}))
@@ -676,6 +719,109 @@ class DoctorIntegrityCases(unittest.TestCase):
                 self.data_dir, self._opts(doc))
         by_id = {r.id: r for r in results}
         self.assertEqual(by_id["upstream_platform"].status, "FAIL")
+
+    # -- Strict doctor schema (OPEN #5): forged/partial READY reports --
+    # Each test removes or poisons ONE nested contract field from the
+    # complete report; every one must refuse READY (upstream_platform
+    # FAIL), per the contract's minimal_forged_READY_rejected_because list.
+
+    def _assert_forged_fails(self, name: str, rep: dict,
+                             evidence_part: str) -> None:
+        doc = self._write_doctor(name, rep)
+        with self._pin_for(doc):
+            results, _ = me_supervisor.run_checks(
+                self.data_dir, self._opts(doc))
+        by_id = {r.id: r for r in results}
+        self.assertEqual(by_id["upstream_platform"].status, "FAIL")
+        self.assertIn(evidence_part, by_id["upstream_platform"].evidence)
+
+    def test_forged_ready_missing_sourcepin_deployed_fails(self):
+        rep = self._ready_report()
+        del rep["checks"]["sourcePin"]["deployed"]
+        self._assert_forged_fails("doc-nodeployed", rep,
+                                  "sourcePin.deployed")
+
+    def test_forged_ready_deployed_patch_not_applied_fails(self):
+        rep = self._ready_report()
+        rep["checks"]["sourcePin"]["deployed"]["patchApplied"] = False
+        self._assert_forged_fails("doc-nopatch", rep, "patchApplied")
+
+    def test_forged_ready_deployed_head_drift_fails(self):
+        rep = self._ready_report()
+        rep["checks"]["sourcePin"]["deployed"]["head"] = "0" * 40
+        self._assert_forged_fails("doc-headdri", rep, "deployed.head")
+
+    def test_forged_ready_missing_nativeauth_fails(self):
+        rep = self._ready_report()
+        del rep["checks"]["nativeAuth"]
+        self._assert_forged_fails("doc-nonauth", rep, "nativeAuth")
+
+    def test_forged_ready_nativeauth_rolegate_open_fails(self):
+        # A shared provider answering the fleet to a user assertion is a
+        # FAILED stack, never READY.
+        rep = self._ready_report()
+        rep["checks"]["nativeAuth"]["roleGate"] = "user-allowed"
+        self._assert_forged_fails("doc-rolegate", rep, "roleGate")
+
+    def test_forged_ready_missing_entitlement_fails(self):
+        rep = self._ready_report()
+        del rep["checks"]["intelligence"]["entitlement"]
+        self._assert_forged_fails("doc-noentitle", rep, "entitlement")
+
+    def test_forged_ready_entitlement_not_ready_fails(self):
+        rep = self._ready_report()
+        rep["checks"]["intelligence"]["entitlement"] = "pending"
+        self._assert_forged_fails("doc-entpend", rep, "entitlement")
+
+    def test_forged_ready_wrong_sdk_version_fails(self):
+        rep = self._ready_report()
+        rep["checks"]["intelligence"]["sdkVersion"] = "1.70.1"
+        self._assert_forged_fails("doc-sdkver", rep, "sdkVersion")
+
+    def test_forged_ready_missing_model_selected_served_fails(self):
+        rep = self._ready_report()
+        del rep["checks"]["model"]["selectedServed"]
+        self._assert_forged_fails("doc-noserved", rep, "selectedServed")
+
+    def test_forged_ready_model_not_served_fails(self):
+        rep = self._ready_report()
+        rep["checks"]["model"]["selectedServed"] = False
+        self._assert_forged_fails("doc-notserved", rep, "selectedServed")
+
+    def test_forged_ready_postgres_unreachable_fails(self):
+        rep = self._ready_report()
+        rep["checks"]["postgres"]["reachable"] = False
+        del rep["checks"]["postgres"]["live"]
+        self._assert_forged_fails("doc-pgdown", rep, "Postgres")
+
+    def test_forged_ready_missing_capabilities_fails(self):
+        rep = self._ready_report()
+        del rep["checks"]["upstreamServer"]["capabilities"]
+        self._assert_forged_fails("doc-nocaps", rep, "capabilities")
+
+    def test_forged_ready_datastore_world_writable_fails(self):
+        rep = self._ready_report()
+        rep["checks"]["datastore"]["home-data"] = "/opt/me/data (mode 777)"
+        self._assert_forged_fails("doc-dsww", rep, "world-writable")
+
+    def test_forged_ready_datastore_bindings_unrecorded_fails(self):
+        rep = self._ready_report()
+        rep["checks"]["datastore"]["volumes"] = [
+            "postgres-data:/var/lib/postgresql/data"]
+        self._assert_forged_fails("doc-dsbind", rep, "bindings unrecorded")
+
+    def test_forged_ready_telemetry_unenforced_fails(self):
+        rep = self._ready_report()
+        del rep["checks"]["telemetry"]["enforced"]
+        self._assert_forged_fails("doc-telenf", rep,
+                                  "telemetry.enforced")
+
+    def test_wrong_contract_marker_fails(self):
+        rep = self._ready_report()
+        rep["doctor_contract"] = "upstream-platform-v1/full.0"
+        rep["checks"]["doctor_contract"] = "upstream-platform-v1/full.0"
+        self._assert_forged_fails("doc-badmarker", rep,
+                                  "versioned full doctor contract")
 
     def test_tampered_doctor_fails_integrity_gate(self):
         doc = self._write_doctor("doc-tamper", self._ready_report())

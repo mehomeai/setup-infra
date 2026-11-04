@@ -143,6 +143,19 @@ DOCTOR_ANCHOR_FILENAME = "doctor.sha256"
 # every name in DOCTOR_REQUIRED_EVIDENCE with verified values, or READY is
 # refused. No guessed endpoints; no fake checks.
 DOCTOR_CONTRACT_REQUIRED = "upstream-platform-v1/full.1"
+# Pinned Intelligence SDK (contract checks_intelligence.sdkVersion; the A
+# doctor pins @copilotkit/runtime at INTELLIGENCE_SDK_PIN). A READY report
+# verified by any other SDK version is not the contracted evidence.
+DOCTOR_INTELLIGENCE_SDK_VERSION = "1.83.0"
+# Native model providers the pinned doctor can resolve (BOT_PROVIDER;
+# BOT_MODEL prefix wins). The local Ollama route is provider "openai" with
+# a local OPENAI_BASE_URL and no key -- never a "local"/"fixture" provider.
+DOCTOR_MODEL_PROVIDERS = ("openai", "anthropic", "google")
+# Datastore bindings the FULL doctor always records (datastorage contract):
+# a READY report whose datastore evidence omits any of them has not recorded
+# its protected bindings.
+DOCTOR_DATASTORE_BINDINGS = ("postgres-data:", "agent-workspace:",
+                             "agent-profiles:")
 # Required READY evidence names (dotted paths into the live report). Missing,
 # unknown-sentinel, or probe:false on ANY of these refuses READY.
 DOCTOR_REQUIRED_EVIDENCE = (
@@ -152,6 +165,7 @@ DOCTOR_REQUIRED_EVIDENCE = (
     "checks.config",
     "checks.supervisor",
     "checks.perUserBoundary",
+    "checks.nativeAuth",
     "checks.versions",
     "checks.license",
     "checks.upstreamServer",
@@ -1523,11 +1537,9 @@ def _validate_doctor_report(doc: object) -> tuple[str, str, dict]:
         return "FAILED", (
             f"doctor sourcePin {lock.get('repo')}@{lock.get('ref')} "
             f"!= {UPSTREAM_REPO}@{UPSTREAM_PIN}"), {}
-    try:
-        files_n = int(lock.get("files", 0) or 0)
-    except (TypeError, ValueError):
-        files_n = 0
-    if files_n <= 0:
+    files_n = lock.get("files")
+    if not isinstance(files_n, int) or isinstance(files_n, bool) \
+            or files_n <= 0:
         return "FAILED", "doctor sourcePin lists no files (not verified)", {}
     mode = str(checks.get("mode", "") or "")
     if mode not in ("full", "core"):
@@ -1539,15 +1551,101 @@ def _validate_doctor_report(doc: object) -> tuple[str, str, dict]:
                 "(computer-plane dev/partial, never production)"), {}
         # The live contract requires probing; the real doctor demotes
         # probe=false READY itself, and any probed:false marker refuses here.
-        if checks.get("probe") is False:
+        # checks.probe must be exactly true (contract: checks_probe true) --
+        # a truthy string/count is not probed evidence.
+        if checks.get("probe") is not True:
             return "FAILED", (
-                "doctor READY with probe=false "
+                "doctor READY without checks.probe === true "
                 "(no-probe reports never authorize READY)"), {}
         bad = _check_unknown_probed(checks)
         if bad:
             return "FAILED", (
                 f"doctor READY with unverified marker at {bad} "
                 "(missing/unknown/probe:false never authorize READY)"), {}
+        # sourcePin nested evidence (contract checks_sourcePin): the pin
+        # must be lock-format verified AND the DEPLOYED checkout verified
+        # against it -- lock-format alone never satisfies READY.
+        if lock.get("verified") != "lock-format":
+            return "FAILED", (
+                "doctor READY with sourcePin.verified != lock-format "
+                f"(got {lock.get('verified')!r})"), {}
+        dep = lock.get("deployed")
+        if not isinstance(dep, dict):
+            return "FAILED", (
+                "doctor READY without checks.sourcePin.deployed "
+                "(deployed checkout not verified)"), {}
+        if dep.get("configured") is not True or dep.get("ok") is not True:
+            return "FAILED", (
+                "doctor READY with sourcePin.deployed not configured/ok "
+                f"(configured={dep.get('configured')!r} "
+                f"ok={dep.get('ok')!r})"), {}
+        if dep.get("patchApplied") is not True:
+            return "FAILED", (
+                "doctor READY with sourcePin.deployed.patchApplied != true "
+                "(approved patch seam not applied)"), {}
+        if dep.get("head") != UPSTREAM_PIN:
+            return "FAILED", (
+                f"doctor READY with sourcePin.deployed.head "
+                f"{dep.get('head')!r} != pin {UPSTREAM_PIN}"), {}
+        dep_files = dep.get("filesOk")
+        if not isinstance(dep_files, int) or isinstance(dep_files, bool) \
+                or dep_files <= 0:
+            return "FAILED", (
+                "doctor READY with sourcePin.deployed.filesOk not a "
+                f"positive count (got {dep_files!r})"), {}
+        if "manifestOk" in dep:
+            man_ok = dep.get("manifestOk")
+            if not isinstance(man_ok, int) or isinstance(man_ok, bool) \
+                    or man_ok <= 0:
+                return "FAILED", (
+                    "doctor READY with sourcePin.deployed.manifestOk not "
+                    f"a positive count (got {man_ok!r})"), {}
+        # nativeAuth nested evidence (contract checks_nativeAuth): the
+        # authenticated native reads must have run and proven the
+        # per-person boundary -- roster, fleet isolation, and the role gate
+        # that denies the fleet to a user assertion.
+        na = checks.get("nativeAuth")
+        if not isinstance(na, dict):
+            return "FAILED", (
+                "doctor READY without checks.nativeAuth "
+                "(native auth probes not run)"), {}
+        if na.get("probed") is not True or na.get("authenticated") is not True:
+            return "FAILED", (
+                "doctor READY with nativeAuth not probed/authenticated "
+                f"(probed={na.get('probed')!r} "
+                f"authenticated={na.get('authenticated')!r})"), {}
+        if na.get("perPerson") is not True \
+                or na.get("perPersonRoster") is not True:
+            return "FAILED", (
+                "doctor READY without nativeAuth per-person roster "
+                "evidence (perPerson/perPersonRoster != true)"), {}
+        if na.get("roleGate") != "user-denied":
+            return "FAILED", (
+                "doctor READY with nativeAuth.roleGate != user-denied "
+                f"(got {na.get('roleGate')!r}; a shared provider answering "
+                "the fleet to a user assertion is FAILED)"), {}
+        agents_n = na.get("agents")
+        if not isinstance(agents_n, int) or isinstance(agents_n, bool) \
+                or agents_n < 0:
+            return "FAILED", (
+                "doctor READY with nativeAuth.agents not a count >= 0 "
+                f"(got {agents_n!r})"), {}
+        fleet = na.get("fleet")
+        if not isinstance(fleet, dict):
+            return "FAILED", (
+                "doctor READY without checks.nativeAuth.fleet "
+                "(fleet probe not run)"), {}
+        for fkey in ("computers", "personKeys"):
+            fval = fleet.get(fkey)
+            if not isinstance(fval, int) or isinstance(fval, bool) \
+                    or fval < 0:
+                return "FAILED", (
+                    f"doctor READY with nativeAuth.fleet.{fkey} not a "
+                    f"count >= 0 (got {fval!r})"), {}
+        if not fleet.get("isolation"):
+            return "FAILED", (
+                "doctor READY without nativeAuth.fleet.isolation "
+                "(gateway isolation not recorded)"), {}
         cfg = checks.get("config") if isinstance(checks.get("config"), dict) else {}
         if cfg.get("gate") != "pass" or cfg.get("missing"):
             return "FAILED", (
@@ -1573,36 +1671,142 @@ def _validate_doctor_report(doc: object) -> tuple[str, str, dict]:
                 "doctor READY without per-user boundary evidence"), {}
         pg = checks.get("postgres") if isinstance(
             checks.get("postgres"), dict) else {}
-        if not pg.get("configured"):
+        if pg.get("configured") is not True:
             return "FAILED", (
                 "doctor READY without Postgres binding "
                 "(product store not verified)"), {}
+        # Contract checks_postgres: reachable + live (TCP answers; the
+        # native agents read proves SQL/migrations). Configured alone is
+        # a URL string, not liveness.
+        if pg.get("reachable") is not True \
+                or not str(pg.get("live", "") or "").strip():
+            return "FAILED", (
+                "doctor READY without live Postgres evidence "
+                f"(reachable={pg.get('reachable')!r} "
+                f"live={pg.get('live')!r})"), {}
         srv = checks.get("upstreamServer") if isinstance(
             checks.get("upstreamServer"), dict) else {}
         shealth = srv.get("health") if isinstance(srv.get("health"), dict) else {}
         if shealth.get("status") != "ok":
             return "FAILED", (
                 "doctor READY with upstream server health != ok"), {}
+        # Contract checks_upstreamServer.capabilities: the mode +
+        # durableHistory projection must be present (absent => drift).
+        caps = srv.get("capabilities")
+        if not isinstance(caps, dict) or not caps.get("mode") \
+                or caps.get("durableHistory") is None:
+            return "FAILED", (
+                "doctor READY without upstreamServer.capabilities "
+                "(mode + durableHistory projection absent => drift)"), {}
         model = checks.get("model") if isinstance(checks.get("model"), dict) else {}
-        if str(model.get("provider", "")) == "fixture":
-            return "FAILED", "doctor READY with fixture model (never READY)", {}
-        if not model.get("provider"):
-            return "FAILED", "doctor READY with unknown model", {}
+        # Contract checks_model: provider is a native BOT_PROVIDER value,
+        # the endpoint is present, and the SELECTED model is actually
+        # served (selectedServed) -- configured alone is not READY.
+        if str(model.get("provider", "")) not in DOCTOR_MODEL_PROVIDERS:
+            return "FAILED", (
+                "doctor READY with model.provider not a native provider "
+                f"(got {model.get('provider')!r}; expected one of "
+                f"{DOCTOR_MODEL_PROVIDERS})"), {}
+        if not str(model.get("endpoint", "") or "").strip():
+            return "FAILED", (
+                "doctor READY without model.endpoint "
+                "(native harness route not present)"), {}
+        if model.get("selectedServed") is not True:
+            return "FAILED", (
+                "doctor READY without checks.model.selectedServed "
+                "(selected model not proven served)"), {}
+        # Contract checks_license: FULL requires the license gate with the
+        # Intelligence key present (the key itself is never in the report).
+        lic = checks.get("license") if isinstance(
+            checks.get("license"), dict) else {}
+        if lic.get("required") is not True or lic.get("keyPresent") is not True:
+            return "FAILED", (
+                "doctor READY without license evidence "
+                f"(required={lic.get('required')!r} "
+                f"keyPresent={lic.get('keyPresent')!r})"), {}
         intel = checks.get("intelligence") if isinstance(
             checks.get("intelligence"), dict) else {}
-        if not intel.get("keyPresent"):
+        if intel.get("keyPresent") is not True:
             return "FAILED", "doctor READY without Intelligence key", {}
-        if not intel.get("selfHosted"):
+        if intel.get("selfHosted") is not True:
             return "FAILED", (
                 "doctor READY without self-hosted Intelligence "
                 "(home privacy requires self-hosted)"), {}
+        # Contract checks_intelligence: ONLY the authenticated SDK
+        # entitlement read satisfies READY -- entitlement "ready", the
+        # deployment licensed, and the SDK at the pinned version.
+        if intel.get("entitlement") != "ready":
+            return "FAILED", (
+                "doctor READY with intelligence.entitlement != ready "
+                f"(got {intel.get('entitlement')!r})"), {}
+        if intel.get("licensed") is not True:
+            return "FAILED", (
+                "doctor READY with intelligence.licensed != true"), {}
+        if intel.get("sdkVersion") != DOCTOR_INTELLIGENCE_SDK_VERSION:
+            return "FAILED", (
+                "doctor READY with intelligence.sdkVersion != pinned "
+                f"{DOCTOR_INTELLIGENCE_SDK_VERSION} "
+                f"(got {intel.get('sdkVersion')!r})"), {}
         tel = checks.get("telemetry") if isinstance(
             checks.get("telemetry"), dict) else {}
-        prod_tel = str(tel.get("product", "") or "").strip().lower()
-        if prod_tel in ("1", "true"):
+        # Contract checks_telemetry: enforcement must be recorded, product
+        # telemetry must not be on, and neither kill switch may be
+        # explicitly off (the A doctor FAILs those as misconfigurations).
+        if not str(tel.get("enforced", "") or "").strip():
+            return "FAILED", (
+                "doctor READY without telemetry.enforced "
+                "(telemetry enforcement unrecorded)"), {}
+        prod_tel = tel.get("product")
+        if prod_tel is True \
+                or str(prod_tel or "").strip().lower() in ("1", "true"):
             return "FAILED", (
                 "doctor READY with upstream product telemetry enabled "
                 "(home default is off)"), {}
+        for tkey in ("disabled", "doNotTrack"):
+            tval = tel.get(tkey)
+            if tval is False \
+                    or str(tval or "").strip().lower() in ("0", "false"):
+                return "FAILED", (
+                    f"doctor READY with telemetry kill switch {tkey} "
+                    "explicitly off (home default forbids upstream "
+                    "telemetry)"), {}
+        # Contract checks_datastore: the protected bindings must be
+        # recorded and no recorded storage dir may be world-writable.
+        # (The A doctor stats only dirs that exist on its host, so a
+        # permission entry is conditional; every entry it does record
+        # must carry a non-world-writable mode.)
+        ds = checks.get("datastore") if isinstance(
+            checks.get("datastore"), dict) else {}
+        vols = ds.get("volumes")
+        if not isinstance(vols, list) or not vols \
+                or not all(isinstance(v, str) and ":" in v for v in vols):
+            return "FAILED", (
+                "doctor READY without datastore bindings recorded "
+                f"(volumes={vols!r})"), {}
+        missing_bindings = [b for b in DOCTOR_DATASTORE_BINDINGS
+                            if not any(v.startswith(b) for v in vols)]
+        if missing_bindings:
+            return "FAILED", (
+                "doctor READY with datastore bindings unrecorded: "
+                f"{','.join(missing_bindings)}"), {}
+        for dkey, dval in ds.items():
+            if dkey in ("volumes", "note") or not isinstance(dval, str):
+                continue
+            mmode = re.search(r"\(mode ([0-7]+)\)", dval)
+            if mmode is None:
+                return "FAILED", (
+                    f"doctor READY with datastore.{dkey} permission "
+                    "unrecorded (no mode in evidence)"), {}
+            if int(mmode.group(1), 8) & 0o002:
+                return "FAILED", (
+                    f"doctor READY with datastore.{dkey} world-writable "
+                    f"(mode {mmode.group(1)})"), {}
+        vers = checks.get("versions") if isinstance(
+            checks.get("versions"), dict) else {}
+        if "pin" in vers and vers.get("pin") != UPSTREAM_PIN:
+            return "FAILED", (
+                f"doctor READY with versions.pin {vers.get('pin')!r} "
+                f"!= {UPSTREAM_PIN}"), {}
         if checks.get("failures"):
             return "FAILED", "doctor READY with failures listed", {}
         if checks.get("needs"):
