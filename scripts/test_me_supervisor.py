@@ -1289,6 +1289,30 @@ class NativeKeyCases(unittest.TestCase):
                          "use_responses_api": False, "capabilities": {}}
         me_setup.write_atomic(me_setup.config_path(self.data_dir),
                               json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+        # Setup activates config.json + service.env TOGETHER from the ONE
+        # selection (do_setup renders both); rewriting only config.json
+        # would leave check_native_model_env comparing against the stale
+        # local render. Re-render via the production renderer.
+        upstream = cfg.get("upstream") or {}
+        env_text = me_setup.render_service_env(
+            db_path=self.data_dir / "data" / "home.sqlite",
+            host="127.0.0.1", port=self.port, models=cfg["models"],
+            coordinator=cfg.get("coordinator"),
+            notifications=cfg.get("notifications"),
+            upstream_mode=str(upstream.get("mode", "") or "") or None)
+        me_setup.write_atomic(self.data_dir / "config" / "service.env",
+                              env_text)
+
+    def test_service_env_value_ignores_trailing_comment(self):
+        # Regression: the writer appends a NONSECRET comment after the
+        # local placeholder key line (`OPENAI_API_KEY='ollama'  # ...`);
+        # the supervisor parser must read the shell value, not the tail,
+        # or model_profile can never PASS for a default local install.
+        parse = me_supervisor._service_env_value
+        self.assertEqual(parse("'ollama'  # NONSECRET placeholder"), "ollama")
+        self.assertEqual(parse("1  # synthetic tests only"), "1")
+        self.assertEqual(parse("'a#b'  # comment"), "a#b")
+        self.assertEqual(parse("abc#def"), "abc#def")
 
     def test_generic_key_satisfies_native_check(self):
         # Generic-only operator key: the probe runs with the BOUND value
@@ -1324,10 +1348,12 @@ class NativeKeyCases(unittest.TestCase):
                                            "OPENAI_API_KEY": "spec-key-2"}), \
              mock.patch.object(me_supervisor, "probe_remote_model",
                                side_effect=spy):
-            me_supervisor.run_checks(
+            results, _ = me_supervisor.run_checks(
                 self.data_dir, {"profile": "production",
                                 "require_service": False, "opencode_bin": ""})
         self.assertEqual(seen.get("key"), "spec-key-2")
+        by_id = {r.id: r for r in results}
+        self.assertEqual(by_id["model_profile"].status, "PASS")
 
     def test_missing_both_keys_is_honest_gate(self):
         self._openai_cfg()

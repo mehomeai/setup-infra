@@ -847,6 +847,56 @@ def check_model_profile(data_dir: Path, cfg: dict | None, opts: dict) -> CheckRe
                        evidence=f"selected engine probed: {detail}")
 
 
+def _service_env_value(raw: str) -> str:
+    """Parse ONE service.env assignment value as the sourcing shell would.
+
+    The writer (me_setup.render_service_env) shlex-quotes values and, for
+    the local placeholder key, appends a trailing comment:
+    `OPENAI_API_KEY='ollama'  # NONSECRET ...`. A parse that only strips
+    quotes reads that whole tail as the value, so model_profile could
+    never PASS for a default local install. Rules (shell word semantics):
+    single/double quotes group, adjacent quoted/bare segments join, `#`
+    opens a comment only at the start of a word (file start here, or
+    after the value word's separating whitespace) outside quotes, and a
+    `#` inside quotes or glued to a bare word is data. Anything after the
+    value word other than whitespace/comment is ignored (lenient: the
+    writer never produces it).
+    """
+    text = raw.strip()
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t":
+            break  # value word ended; only ws + optional comment follows
+        if ch == "#" and i == 0:
+            break  # value is empty; the rest is a comment
+        if ch == "'":
+            end = text.find("'", i + 1)
+            if end == -1:  # unterminated: lenient, take the remainder
+                out.append(text[i + 1:])
+                break
+            out.append(text[i + 1:end])
+            i = end + 1
+        elif ch == '"':
+            buf: list[str] = []
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n and text[i + 1] in '"\\$`':
+                    i += 1
+                buf.append(text[i])
+                i += 1
+            out.append("".join(buf))
+            i += 1  # skip the closing quote (or run off the end)
+        elif ch == "\\" and i + 1 < n:
+            out.append(text[i + 1])
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def check_native_model_env(data_dir: Path, cfg: dict | None,
                            models: dict) -> CheckResult | None:
     """ONE selected full-model config must reach the native harness env.
@@ -894,7 +944,7 @@ def check_native_model_env(data_dir: Path, cfg: dict | None,
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, _, v = line.partition("=")
-        have[k.strip()] = v.strip().strip("'\"")
+        have[k.strip()] = _service_env_value(v)
     missing = [f"{k}={v}" for k, v in expected.items() if have.get(k) != v]
     if missing:
         return CheckResult("model_profile", "FAIL",
