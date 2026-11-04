@@ -319,7 +319,13 @@ class PrepareTests(unittest.TestCase):
         self.addCleanup(self.node_patch.stop)
         self.data_dir = make_data_dir(self)
         self.port = free_port()
-        self.cfg = run_setup(self, self.data_dir, self.port)
+        # Hermetic fixture: test_prepare_uses_tunnel_hostname_when_no_flag
+        # configures a tunnel, which fails closed unless the config records
+        # the published H1 contract. Pin the probe to the published contract
+        # exactly as a sibling layout records it (see test_me_lifecycle.py).
+        with mock.patch.object(me_setup, "contract_status",
+                               return_value=me_setup.CONTRACT_VERSION):
+            self.cfg = run_setup(self, self.data_dir, self.port)
         ensure_test_db(self.data_dir, self.cfg)
 
     def test_prepare_records_install_and_public_url_no_network(self):

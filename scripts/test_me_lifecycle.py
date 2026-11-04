@@ -77,7 +77,16 @@ class LifecycleUnit(unittest.TestCase):
         self.node_patch.start()
         self.addCleanup(self.node_patch.stop)
         self.port = free_port()
-        self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", self.port), 0)
+        # Hermetic fixture: the tunnel unit tests exercise lifecycle logic
+        # against a published H1 contract. A standalone checkout (no
+        # ../infra-server sibling) would stamp "pending-h1" into the config
+        # and every tunnel configure would fail closed before reaching the
+        # behavior under test, so pin the probe to the published contract
+        # exactly as a sibling layout records it. The one test that
+        # exercises the pending-h1 refusal sets it explicitly afterwards.
+        with mock.patch.object(me_setup, "contract_status",
+                               return_value=me_setup.CONTRACT_VERSION):
+            self.assertEqual(me_setup.do_setup(self.data_dir, "127.0.0.1", self.port), 0)
 
     def test_status_stopped_exit_1(self):
         self.assertEqual(me_lifecycle.do_status(self.data_dir), 1)
@@ -291,7 +300,11 @@ class LifecycleUnit(unittest.TestCase):
         # Non-loopback binding -> configure refuses (would expose more than the
         # verified loopback API).
         other = self.tmp / "other"
-        self.assertEqual(me_setup.do_setup(other, "127.0.0.1", free_port()), 0)
+        # Same hermetic contract pin as setUp: the refusal under test below
+        # is the non-loopback binding, not the contract precondition.
+        with mock.patch.object(me_setup, "contract_status",
+                               return_value=me_setup.CONTRACT_VERSION):
+            self.assertEqual(me_setup.do_setup(other, "127.0.0.1", free_port()), 0)
         cfg2 = me_setup.load_config(other)
         cfg2["service"]["host"] = "0.0.0.0"
         me_setup.write_atomic(me_setup.config_path(other),

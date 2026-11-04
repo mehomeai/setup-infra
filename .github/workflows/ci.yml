@@ -37,18 +37,34 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          path: setup-infra
+      - name: Check out infra-server (H1 sibling contract)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mehomeai/infra-server
+          persist-credentials: false
+          path: infra-server
       - name: Set up Node.js (matches home-api-v1 local requirement)
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.18.0
+      - name: Install OpenCode (supervisor discovery mirrors dev machines)
+        # The supervisor's opencode_cli check discovers the CLI at
+        # ~/.opencode/bin or on PATH, exactly as on a dev machine; without
+        # this the operational-readiness cases park at NEEDS_INPUT.
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
       - name: Run setup suites (all offline unit + fail-closed integration)
         # Runs ALL test_me*.py: setup, lifecycle, full-backup, crash-window.
         # Sibling-dependent H1 cases skip with a transient note when
         # ../infra-server or Node is unavailable (existing practice); unit,
         # guardrail, backup/restore, and tunnel fail-closed tests run here.
         # Do not narrow to two files: that omits full-backup/crash-window.
+        working-directory: setup-infra
         run: python3 -m unittest discover -s scripts -p 'test_me*.py' -v
       - name: Smoke-test rerunnable setup and check
+        working-directory: setup-infra
         run: |
           DEST="$(mktemp -d)/me-home"
           python3 scripts/me_setup.py setup --data-dir "$DEST"
