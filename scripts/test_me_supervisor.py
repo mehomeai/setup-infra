@@ -864,6 +864,18 @@ class DoctorIntegrityCases(unittest.TestCase):
         self.assertEqual(by_id["upstream_platform"].status, "FAIL")
 
     def test_missing_doctor_parks_needs_input(self):
+        # The assertions below rest on the sibling fallback: with no
+        # --upstream-doctor given, the supervisor falls back to the trusted
+        # sibling infra-server checkout. A standalone checkout has no
+        # sibling to fall back to, so the park reason differs; skip there,
+        # mirroring require_h1_contract() in test_me_setup.py.
+        if me_setup.resolve_checkout(
+                None, "ME_HOME_INFRA_CHECKOUT", "infra-server",
+                ("src/cli.mjs",), "upstream doctor") is None:
+            self.skipTest(
+                "transient dependency: infra-server sibling checkout "
+                "unavailable (H1 may still be modifying home); rerun when "
+                "stable")
         results, _ = me_supervisor.run_checks(
             self.data_dir, {"profile": "production", "require_service": False,
                             "opencode_bin": "",
